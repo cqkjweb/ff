@@ -28,9 +28,11 @@ class AffineMotionModel(nn.Module):
             nn.Linear(hidden_dim, 6)  # [a0, a1, a2, b0, b1, b2]
         )
         
-        # 初始化为零光流
-        self.motion_mlp[-1].weight.data.zero_()
-        self.motion_mlp[-1].bias.data.zero_()
+        # 使用 Xavier 初始化
+        for m in self.motion_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
         
     def forward(self, slots, coords, image_size):
         """
@@ -56,25 +58,24 @@ class AffineMotionModel(nn.Module):
         x_norm = 2.0 * x / max(W - 1, 1) - 1.0  # [-1, 1]
         y_norm = 2.0 * y / max(H - 1, 1) - 1.0
         
-        # 解析参数 [B, K, 6]
-        a0 = affine_params[:, :, 0].view(B, K, 1, 1)  # [B, K, 1, 1]
-        a1 = affine_params[:, :, 1].view(B, K, 1, 1)
-        a2 = affine_params[:, :, 2].view(B, K, 1, 1)
-        b0 = affine_params[:, :, 3].view(B, K, 1, 1)
-        b1 = affine_params[:, :, 4].view(B, K, 1, 1)
-        b2 = affine_params[:, :, 5].view(B, K, 1, 1)
+        # 解析参数 [B, K, 6] - 乘以缩放因子让输出在合理范围
+        params_scaled = affine_params * 30.0  # 缩放到合理范围
+        
+        a0 = params_scaled[:, :, 0].view(B, K, 1, 1)  # [B, K, 1, 1]
+        a1 = params_scaled[:, :, 1].view(B, K, 1, 1)
+        a2 = params_scaled[:, :, 2].view(B, K, 1, 1)
+        b0 = params_scaled[:, :, 3].view(B, K, 1, 1)
+        b1 = params_scaled[:, :, 4].view(B, K, 1, 1)
+        b2 = params_scaled[:, :, 5].view(B, K, 1, 1)
         
         # x_norm, y_norm: [B, 1, H, W] -> 广播到 [B, K, H, W]
         x_norm = x_norm.squeeze(1)  # [B, H, W]
         y_norm = y_norm.squeeze(1)  # [B, H, W]
         
-        # 计算光流 (归一化空间) - 广播 [B, K, 1, 1] * [B, H, W] -> [B, K, H, W]
-        flow_x_norm = a0 + a1 * x_norm.unsqueeze(1) + a2 * y_norm.unsqueeze(1)  # [B, K, H, W]
-        flow_y_norm = b0 + b1 * x_norm.unsqueeze(1) + b2 * y_norm.unsqueeze(1)  # [B, K, H, W]
-        
-        # 转换到像素空间
-        flow_x = flow_x_norm * (W_full / 2.0)  # [B, K, H, W]
-        flow_y = flow_y_norm * (H_full / 2.0)  # [B, K, H, W]
+        # 计算光流 - 直接在像素空间计算
+        # x_norm, y_norm 在 [-1, 1]，乘以参数后得到像素位移
+        flow_x = a0 + a1 * x_norm.unsqueeze(1) + a2 * y_norm.unsqueeze(1)  # [B, K, H, W]
+        flow_y = b0 + b1 * x_norm.unsqueeze(1) + b2 * y_norm.unsqueeze(1)  # [B, K, H, W]
         
         # 堆叠成 [B, K, 2, H, W]
         flows = torch.stack([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
@@ -94,12 +95,16 @@ class TranslationMotionModel(nn.Module):
         self.motion_mlp = nn.Sequential(
             nn.Linear(slot_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2)  # [tx, ty]
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2)  # [tx, ty] 直接输出像素单位的位移
         )
         
-        # 初始化为零
-        self.motion_mlp[-1].weight.data.zero_()
-        self.motion_mlp[-1].bias.data.zero_()
+        # 使用 Xavier 初始化，让输出有合理的初始范围
+        for m in self.motion_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
         
     def forward(self, slots, coords, image_size):
         """
@@ -116,12 +121,12 @@ class TranslationMotionModel(nn.Module):
         _, _, H, W = coords.shape
         H_full, W_full = image_size
         
-        # 预测平移参数 (归一化空间 [-1, 1])
-        translation = self.motion_mlp(slots)  # [B, K, 2]
+        # 预测平移参数 - 直接输出像素单位的位移
+        # 乘以一个缩放因子让初始输出在合理范围
+        translation = self.motion_mlp(slots) * 50.0  # [B, K, 2], 缩放到 ~[-50, 50] 像素
         
-        # 转换到像素空间
-        tx = translation[:, :, 0] * (W_full / 2.0)  # [B, K]
-        ty = translation[:, :, 1] * (H_full / 2.0)  # [B, K]
+        tx = translation[:, :, 0]  # [B, K]
+        ty = translation[:, :, 1]  # [B, K]
         
         # 广播到空间维度 [B, K] -> [B, K, H, W]
         flow_x = tx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)  # [B, K, H, W]

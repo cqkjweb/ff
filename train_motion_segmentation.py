@@ -306,7 +306,7 @@ def main():
     
     # Phase 1 参数
     parser.add_argument('--phase1_steps', type=int, default=50000, help="phase 1 training steps")
-    parser.add_argument('--phase1_lr', type=float, default=2e-4, help="phase 1 learning rate")
+    parser.add_argument('--phase1_lr', type=float, default=1e-3, help="phase 1 learning rate")
     
     # Phase 2 参数
     parser.add_argument('--phase2_steps', type=int, default=100000, help="phase 2 training steps")
