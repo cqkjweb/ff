@@ -243,17 +243,18 @@ class HybridMotionDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 8)  # 8 参数的单应性 (去掉 scale)
+            nn.Linear(hidden_dim, 8),  # 8 参数的单应性 (去掉 scale)
+            nn.Tanh()  # 限制参数范围
         )
         
-        # 初始化为恒等变换，但给一个较大的初始值让梯度能流动
-        # 增大初始化标准差，让模型能更快学习到大范围运动
-        nn.init.kaiming_normal_(self.global_motion_encoder[-1].weight, mode='fan_out', nonlinearity='linear')
-        self.global_motion_encoder[-1].weight.data *= 2.0  # 放大初始权重
-        nn.init.zeros_(self.global_motion_encoder[-1].bias)
+        # 使用正常初始化
+        nn.init.xavier_uniform_(self.global_motion_encoder[-2].weight)
+        nn.init.zeros_(self.global_motion_encoder[-2].bias)
         
-        # 可学习的全局缩放因子 - 增大初始值
-        self.global_scale = nn.Parameter(torch.tensor(10.0))
+        # 单应性参数的缩放因子 (tanh 输出 * scale 得到实际参数)
+        # 对于平移参数 (h13, h23)，需要较大的范围
+        # 对于其他参数，范围较小
+        self.homography_scale = 0.5  # 控制单应性变换的强度
         
         # 每个 Slot 的残差光流解码器
         self.slot_proj = nn.Sequential(
@@ -263,7 +264,7 @@ class HybridMotionDecoder(nn.Module):
             nn.GELU()
         )
         
-        # 残差光流 CNN - 增加网络容量
+        # 残差光流 CNN - 输出经过 tanh 限制范围
         self.residual_decoder = nn.Sequential(
             nn.Conv2d(hidden_dim + 2, hidden_dim, 3, 1, 1),  # +2 for position
             nn.GroupNorm(8, hidden_dim),
@@ -274,17 +275,16 @@ class HybridMotionDecoder(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
             nn.GroupNorm(8, hidden_dim),
             nn.GELU(),
-            nn.Conv2d(hidden_dim, 2, 3, 1, 1)
+            nn.Conv2d(hidden_dim, 2, 3, 1, 1),
+            nn.Tanh()  # 限制输出在 [-1, 1]
         )
         
-        # 初始化残差为较大值，让模型能学习大范围运动
-        # 使用 kaiming 初始化最后一层，然后乘以较大的系数
-        nn.init.kaiming_normal_(self.residual_decoder[-1].weight, mode='fan_out', nonlinearity='linear')
-        self.residual_decoder[-1].weight.data *= 5.0  # 放大初始权重
-        nn.init.zeros_(self.residual_decoder[-1].bias)
+        # 使用正常初始化，tanh 会限制输出范围
+        nn.init.xavier_uniform_(self.residual_decoder[-2].weight)
+        nn.init.zeros_(self.residual_decoder[-2].bias)
         
-        # 可学习的残差缩放因子 - 初始值设为 100 以匹配目标光流范围
-        self.residual_scale = nn.Parameter(torch.tensor(100.0))
+        # 最大光流幅度 - 固定值，不需要学习
+        self.max_flow = 150.0  # 像素
     
     def compute_homography_flow(self, H_params, coords, H_full, W_full):
         """
@@ -349,10 +349,10 @@ class HybridMotionDecoder(nn.Module):
         H_full, W_full = full_size
         device = slots.device
         
-        # 1. 估计全局单应性
+        # 1. 估计全局单应性 (输出已经经过 tanh，范围 [-1, 1])
         H_params = self.global_motion_encoder(context_feat)  # [B, 8]
-        # 应用可学习的缩放因子
-        H_params = H_params * self.global_scale
+        # 应用缩放因子
+        H_params = H_params * self.homography_scale
         
         # 创建归一化坐标网格
         y = torch.linspace(-1, 1, H, device=device)
@@ -375,10 +375,10 @@ class HybridMotionDecoder(nn.Module):
             # 拼接位置信息
             feat_with_pos = torch.cat([feat_k, coords], dim=1)  # [B, hidden_dim+2, H, W]
             
-            # 预测残差光流
+            # 预测残差光流 (输出已经经过 tanh，范围 [-1, 1])
             residual_flow = self.residual_decoder(feat_with_pos)  # [B, 2, H, W]
-            # 使用可学习的缩放因子，初始值较大以匹配目标光流范围
-            residual_flow = residual_flow * self.residual_scale
+            # 缩放到像素空间
+            residual_flow = residual_flow * self.max_flow
             
             # 总光流 = 全局光流 + 残差光流
             total_flow_k = global_flow + residual_flow

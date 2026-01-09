@@ -142,11 +142,6 @@ def train_phase1(model, train_loader, cfg, logger_path):
                     loguru_logger.info(f"  flow_target range: [{flow_target.min():.2f}, {flow_target.max():.2f}]")
                     loguru_logger.info(f"  flow_recon range: [{output['flow_recon'].min():.2f}, {output['flow_recon'].max():.2f}]")
                     loguru_logger.info(f"  masks sum: {output['masks'].sum(dim=1).mean():.4f}")
-                    # 显示缩放因子
-                    if hasattr(model.motion_decoder.motion_model, 'residual_scale'):
-                        loguru_logger.info(f"  residual_scale: {model.motion_decoder.motion_model.residual_scale.item():.2f}")
-                    if hasattr(model.motion_decoder.motion_model, 'global_scale'):
-                        loguru_logger.info(f"  global_scale: {model.motion_decoder.motion_model.global_scale.item():.2f}")
                 
                 # 每 1000 步打印一次详细信息
                 if total_steps > 0 and total_steps % 1000 == 0:
@@ -154,20 +149,11 @@ def train_phase1(model, train_loader, cfg, logger_path):
                         flow_err = (output['flow_recon'] - flow_target).abs().mean()
                         flow_recon_mag = output['flow_recon'].abs().mean()
                         flow_target_mag = flow_target.abs().mean()
-                        
-                        # 监控缩放因子
-                        scale_info = ""
-                        if hasattr(model.motion_decoder.motion_model, 'residual_scale'):
-                            res_scale = model.motion_decoder.motion_model.residual_scale.item()
-                            scale_info += f"res_scale: {res_scale:.2f}, "
-                        if hasattr(model.motion_decoder.motion_model, 'global_scale'):
-                            glob_scale = model.motion_decoder.motion_model.global_scale.item()
-                            scale_info += f"glob_scale: {glob_scale:.2f}"
                             
                     loguru_logger.info(
                         f"  [详细] flow_recon_mag: {flow_recon_mag:.2f}, "
                         f"flow_target_mag: {flow_target_mag:.2f}, "
-                        f"avg_err: {flow_err:.2f}, {scale_info}"
+                        f"avg_err: {flow_err:.2f}"
                     )
                 
                 # 计算损失
