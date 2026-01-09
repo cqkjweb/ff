@@ -53,29 +53,31 @@ class AffineMotionModel(nn.Module):
         # 归一化坐标到 [-1, 1]
         x = coords[:, 0:1]  # [B, 1, H, W]
         y = coords[:, 1:2]
-        x_norm = 2.0 * x / (W - 1) - 1.0  # [-1, 1]
-        y_norm = 2.0 * y / (H - 1) - 1.0
+        x_norm = 2.0 * x / max(W - 1, 1) - 1.0  # [-1, 1]
+        y_norm = 2.0 * y / max(H - 1, 1) - 1.0
         
         # 解析参数 [B, K, 6]
-        a0 = affine_params[:, :, 0:1].unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1, 1]
-        a1 = affine_params[:, :, 1:2].unsqueeze(-1).unsqueeze(-1)
-        a2 = affine_params[:, :, 2:3].unsqueeze(-1).unsqueeze(-1)
-        b0 = affine_params[:, :, 3:4].unsqueeze(-1).unsqueeze(-1)
-        b1 = affine_params[:, :, 4:5].unsqueeze(-1).unsqueeze(-1)
-        b2 = affine_params[:, :, 5:6].unsqueeze(-1).unsqueeze(-1)
+        a0 = affine_params[:, :, 0].view(B, K, 1, 1)  # [B, K, 1, 1]
+        a1 = affine_params[:, :, 1].view(B, K, 1, 1)
+        a2 = affine_params[:, :, 2].view(B, K, 1, 1)
+        b0 = affine_params[:, :, 3].view(B, K, 1, 1)
+        b1 = affine_params[:, :, 4].view(B, K, 1, 1)
+        b2 = affine_params[:, :, 5].view(B, K, 1, 1)
         
-        x_norm = x_norm.unsqueeze(1)  # [B, 1, 1, H, W]
-        y_norm = y_norm.unsqueeze(1)
+        # x_norm, y_norm: [B, 1, H, W] -> 广播到 [B, K, H, W]
+        x_norm = x_norm.squeeze(1)  # [B, H, W]
+        y_norm = y_norm.squeeze(1)  # [B, H, W]
         
-        # 计算光流 (归一化空间)
-        flow_x_norm = a0 + a1 * x_norm + a2 * y_norm  # [B, K, 1, H, W]
-        flow_y_norm = b0 + b1 * x_norm + b2 * y_norm
+        # 计算光流 (归一化空间) - 广播 [B, K, 1, 1] * [B, H, W] -> [B, K, H, W]
+        flow_x_norm = a0 + a1 * x_norm.unsqueeze(1) + a2 * y_norm.unsqueeze(1)  # [B, K, H, W]
+        flow_y_norm = b0 + b1 * x_norm.unsqueeze(1) + b2 * y_norm.unsqueeze(1)  # [B, K, H, W]
         
         # 转换到像素空间
-        flow_x = flow_x_norm * (W_full / 2.0)
-        flow_y = flow_y_norm * (H_full / 2.0)
+        flow_x = flow_x_norm * (W_full / 2.0)  # [B, K, H, W]
+        flow_y = flow_y_norm * (H_full / 2.0)  # [B, K, H, W]
         
-        flows = torch.cat([flow_x.squeeze(2), flow_y.squeeze(2)], dim=2)  # [B, K, 2, H, W]
+        # 堆叠成 [B, K, 2, H, W]
+        flows = torch.stack([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
         
         return flows, affine_params
 
@@ -118,14 +120,15 @@ class TranslationMotionModel(nn.Module):
         translation = self.motion_mlp(slots)  # [B, K, 2]
         
         # 转换到像素空间
-        tx = translation[:, :, 0:1] * (W_full / 2.0)  # [B, K, 1]
-        ty = translation[:, :, 1:2] * (H_full / 2.0)
+        tx = translation[:, :, 0] * (W_full / 2.0)  # [B, K]
+        ty = translation[:, :, 1] * (H_full / 2.0)  # [B, K]
         
-        # 广播到空间维度
-        flow_x = tx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, H, W)  # [B, K, 1, H, W]
-        flow_y = ty.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, H, W)
+        # 广播到空间维度 [B, K] -> [B, K, H, W]
+        flow_x = tx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)  # [B, K, H, W]
+        flow_y = ty.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)  # [B, K, H, W]
         
-        flows = torch.cat([flow_x.squeeze(2), flow_y.squeeze(2)], dim=2)  # [B, K, 2, H, W]
+        # 堆叠成 [B, K, 2, H, W]
+        flows = torch.stack([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
         
         return flows, translation
 

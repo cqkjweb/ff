@@ -373,7 +373,7 @@ def main():
             batch_size=args.batch_size,
             pin_memory=False, 
             shuffle=True, 
-            num_workers=8,  # 减少 worker 数量
+            num_workers=16,  # 减少 worker 数量
             drop_last=True
         )
     
