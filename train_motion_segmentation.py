@@ -18,6 +18,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+# 解决 "Too many open files" 问题
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 from loguru import logger as loguru_logger
 
 from core.FlowFormer import build_flowformer
@@ -101,11 +104,11 @@ def train_phase1(model, train_loader, cfg, logger_path):
         pct_start=0.1
     )
     
-    # 损失函数
+    # 损失函数 - 初期只用重建损失，减少正则化干扰
     criterion = SegmentationLoss(
         recon_weight=1.0,
-        mask_reg_weight=0.1,
-        motion_consist_weight=0.05
+        mask_reg_weight=0.01,  # 降低正则化权重
+        motion_consist_weight=0.0  # 初期关闭运动一致性损失
     )
     
     scaler = GradScaler(enabled=cfg.mixed_precision)
@@ -115,6 +118,8 @@ def train_phase1(model, train_loader, cfg, logger_path):
     
     total_steps = 0
     running_loss = 0.0
+    running_recon = 0.0
+    running_mask_reg = 0.0
     
     while total_steps < cfg.phase1_steps:
         for i_batch, data_blob in enumerate(train_loader):
@@ -132,6 +137,12 @@ def train_phase1(model, train_loader, cfg, logger_path):
                 else:
                     flow_target = output['flow_pred'].detach()
                 
+                # 调试信息 (前几个 step)
+                if total_steps < 5:
+                    loguru_logger.info(f"  flow_target range: [{flow_target.min():.2f}, {flow_target.max():.2f}]")
+                    loguru_logger.info(f"  flow_recon range: [{output['flow_recon'].min():.2f}, {output['flow_recon'].max():.2f}]")
+                    loguru_logger.info(f"  masks sum: {output['masks'].sum(dim=1).mean():.4f}")
+                
                 # 计算损失
                 loss, loss_dict = criterion(output, flow_target)
             
@@ -143,17 +154,23 @@ def train_phase1(model, train_loader, cfg, logger_path):
             scaler.update()
             
             running_loss += loss.item()
+            running_recon += loss_dict['loss_recon']
+            running_mask_reg += loss_dict.get('loss_mask_reg', 0)
             total_steps += 1
             
             if total_steps % cfg.log_freq == 0:
                 avg_loss = running_loss / cfg.log_freq
+                avg_recon = running_recon / cfg.log_freq
+                avg_mask_reg = running_mask_reg / cfg.log_freq
                 lr = scheduler.get_last_lr()[0]
                 loguru_logger.info(
                     f"Phase1 Step {total_steps}/{cfg.phase1_steps} | "
-                    f"Loss: {avg_loss:.4f} | LR: {lr:.6f} | "
-                    f"Recon: {loss_dict['loss_recon']:.4f}"
+                    f"Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | "
+                    f"MaskReg: {avg_mask_reg:.4f} | LR: {lr:.6f}"
                 )
                 running_loss = 0.0
+                running_recon = 0.0
+                running_mask_reg = 0.0
                 
             if total_steps % cfg.save_freq == 0:
                 save_path = os.path.join(logger_path, f'phase1_step{total_steps}.pth')
@@ -284,7 +301,7 @@ def main():
     parser.add_argument('--slot_dim', type=int, default=64, help="slot dimension")
     parser.add_argument('--hidden_dim', type=int, default=128, help="hidden dimension")
     parser.add_argument('--slot_iterations', type=int, default=3, help="slot attention iterations")
-    parser.add_argument('--motion_model', type=str, default='affine', choices=['affine', 'quadratic'])
+    parser.add_argument('--motion_model', type=str, default='translation', choices=['affine', 'translation'])
     parser.add_argument('--feature_scale', type=str, default='1/8', choices=['1/4', '1/8'])
     
     # Phase 1 参数
@@ -343,8 +360,24 @@ def main():
     model = create_model(cfg, args.flowformer_ckpt)
     loguru_logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     
-    # 加载数据
-    train_loader = datasets.fetch_dataloader(cfg)
+    # 加载数据 - 使用较少的 workers 避免 "Too many open files" 错误
+    import torch.utils.data as data
+    
+    # 临时修改 num_workers
+    original_fetch = datasets.fetch_dataloader
+    def fetch_dataloader_safe(args, TRAIN_DS='C+T+K+S+H'):
+        loader = original_fetch(args, TRAIN_DS)
+        # 重新创建 DataLoader 使用较少的 workers
+        return data.DataLoader(
+            loader.dataset, 
+            batch_size=args.batch_size,
+            pin_memory=False, 
+            shuffle=True, 
+            num_workers=8,  # 减少 worker 数量
+            drop_last=True
+        )
+    
+    train_loader = fetch_dataloader_safe(cfg)
     
     # Phase 1
     if not args.skip_phase1:

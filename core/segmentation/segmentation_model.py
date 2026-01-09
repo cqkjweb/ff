@@ -105,13 +105,14 @@ class MotionSegmentationModel(nn.Module):
         # 目标尺寸: 1/8 分辨率 (与 FlowFormer 内部一致)
         H8, W8 = H // 8, W // 8
         flow_recon, slot_flows, motion_params = self.motion_decoder(
-            slots, attn_masks, target_size=(H8, W8)
+            slots, attn_masks, target_size=(H8, W8), full_size=(H, W)
         )
         
         # 上采样重建光流到原始分辨率
         flow_recon_full = F.interpolate(
             flow_recon, size=(H, W), mode='bilinear', align_corners=False
-        ) * 8  # 缩放因子
+        )
+        # 注意：不需要乘以 8，因为 motion_decoder 已经输出像素单位的光流
         
         # 上采样 masks 到原始分辨率
         masks_full = F.interpolate(

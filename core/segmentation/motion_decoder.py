@@ -11,9 +11,10 @@ from einops import rearrange, repeat
 
 class AffineMotionModel(nn.Module):
     """
-    仿射运动模型
-    每个 slot 预测 6 个仿射参数: [a, b, tx, c, d, ty]
-    flow(x, y) = [a*x + b*y + tx, c*x + d*y + ty]
+    仿射运动模型 - 简化版本
+    每个 slot 直接预测光流的仿射参数
+    flow(x, y) = [a0 + a1*x_norm + a2*y_norm, b0 + b1*x_norm + b2*y_norm]
+    其中 x_norm, y_norm 是归一化到 [-1, 1] 的坐标
     """
     
     def __init__(self, slot_dim: int = 64, hidden_dim: int = 128):
@@ -24,66 +25,65 @@ class AffineMotionModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 6)  # 6 个仿射参数
+            nn.Linear(hidden_dim, 6)  # [a0, a1, a2, b0, b1, b2]
         )
         
-        # 初始化为恒等变换
+        # 初始化为零光流
         self.motion_mlp[-1].weight.data.zero_()
-        self.motion_mlp[-1].bias.data = torch.tensor([1., 0., 0., 0., 1., 0.])
+        self.motion_mlp[-1].bias.data.zero_()
         
-    def forward(self, slots, coords):
+    def forward(self, slots, coords, image_size):
         """
         Args:
             slots: [B, K, D] slot 特征
-            coords: [B, 2, H, W] 像素坐标网格
+            coords: [B, 2, H, W] 像素坐标网格 (x, y)
+            image_size: (H_full, W_full) 原始图像尺寸，用于缩放
             
         Returns:
-            flows: [B, K, 2, H, W] 每个 slot 的运动场
+            flows: [B, K, 2, H, W] 每个 slot 的运动场 (像素单位)
+            affine_params: [B, K, 6] 仿射参数
         """
         B, K, D = slots.shape
         _, _, H, W = coords.shape
+        H_full, W_full = image_size
         
         # 预测仿射参数
         affine_params = self.motion_mlp(slots)  # [B, K, 6]
         
-        # 解析参数
-        a = affine_params[..., 0:1]  # [B, K, 1]
-        b = affine_params[..., 1:2]
-        tx = affine_params[..., 2:3]
-        c = affine_params[..., 3:4]
-        d = affine_params[..., 4:5]
-        ty = affine_params[..., 5:6]
-        
-        # 坐标网格
+        # 归一化坐标到 [-1, 1]
         x = coords[:, 0:1]  # [B, 1, H, W]
-        y = coords[:, 1:2]  # [B, 1, H, W]
+        y = coords[:, 1:2]
+        x_norm = 2.0 * x / (W - 1) - 1.0  # [-1, 1]
+        y_norm = 2.0 * y / (H - 1) - 1.0
         
-        # 计算每个 slot 的光流
-        # flow_x = (a-1)*x + b*y + tx  (减去恒等变换)
-        # flow_y = c*x + (d-1)*y + ty
-        a = a.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1, 1]
-        b = b.unsqueeze(-1).unsqueeze(-1)
-        tx = tx.unsqueeze(-1).unsqueeze(-1)
-        c = c.unsqueeze(-1).unsqueeze(-1)
-        d = d.unsqueeze(-1).unsqueeze(-1)
-        ty = ty.unsqueeze(-1).unsqueeze(-1)
+        # 解析参数 [B, K, 6]
+        a0 = affine_params[:, :, 0:1].unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1, 1]
+        a1 = affine_params[:, :, 1:2].unsqueeze(-1).unsqueeze(-1)
+        a2 = affine_params[:, :, 2:3].unsqueeze(-1).unsqueeze(-1)
+        b0 = affine_params[:, :, 3:4].unsqueeze(-1).unsqueeze(-1)
+        b1 = affine_params[:, :, 4:5].unsqueeze(-1).unsqueeze(-1)
+        b2 = affine_params[:, :, 5:6].unsqueeze(-1).unsqueeze(-1)
         
-        x = x.unsqueeze(1)  # [B, 1, 1, H, W]
-        y = y.unsqueeze(1)
+        x_norm = x_norm.unsqueeze(1)  # [B, 1, 1, H, W]
+        y_norm = y_norm.unsqueeze(1)
         
-        flow_x = (a - 1) * x + b * y + tx  # [B, K, 1, H, W]
-        flow_y = c * x + (d - 1) * y + ty
+        # 计算光流 (归一化空间)
+        flow_x_norm = a0 + a1 * x_norm + a2 * y_norm  # [B, K, 1, H, W]
+        flow_y_norm = b0 + b1 * x_norm + b2 * y_norm
         
-        flows = torch.cat([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
-        flows = flows.squeeze(3) if flows.dim() == 6 else flows
+        # 转换到像素空间
+        flow_x = flow_x_norm * (W_full / 2.0)
+        flow_y = flow_y_norm * (H_full / 2.0)
+        
+        flows = torch.cat([flow_x.squeeze(2), flow_y.squeeze(2)], dim=2)  # [B, K, 2, H, W]
         
         return flows, affine_params
 
 
-class QuadraticMotionModel(nn.Module):
+class TranslationMotionModel(nn.Module):
     """
-    二次运动模型 (更灵活，可以建模旋转和缩放)
-    每个 slot 预测 12 个参数
+    纯平移运动模型 - 最简单的模型
+    每个 slot 只预测一个平移向量 (tx, ty)
     """
     
     def __init__(self, slot_dim: int = 64, hidden_dim: int = 128):
@@ -92,55 +92,42 @@ class QuadraticMotionModel(nn.Module):
         self.motion_mlp = nn.Sequential(
             nn.Linear(slot_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 12)  # 12 个二次参数
+            nn.Linear(hidden_dim, 2)  # [tx, ty]
         )
         
-        # 初始化为零运动
+        # 初始化为零
         self.motion_mlp[-1].weight.data.zero_()
         self.motion_mlp[-1].bias.data.zero_()
         
-    def forward(self, slots, coords):
+    def forward(self, slots, coords, image_size):
         """
         Args:
             slots: [B, K, D] slot 特征
             coords: [B, 2, H, W] 像素坐标网格
+            image_size: (H_full, W_full) 原始图像尺寸
             
         Returns:
             flows: [B, K, 2, H, W] 每个 slot 的运动场
+            motion_params: [B, K, 2] 平移参数
         """
         B, K, D = slots.shape
         _, _, H, W = coords.shape
+        H_full, W_full = image_size
         
-        # 预测参数
-        params = self.motion_mlp(slots)  # [B, K, 12]
+        # 预测平移参数 (归一化空间 [-1, 1])
+        translation = self.motion_mlp(slots)  # [B, K, 2]
         
-        # 坐标
-        x = coords[:, 0:1].unsqueeze(1)  # [B, 1, 1, H, W]
-        y = coords[:, 1:2].unsqueeze(1)
+        # 转换到像素空间
+        tx = translation[:, :, 0:1] * (W_full / 2.0)  # [B, K, 1]
+        ty = translation[:, :, 1:2] * (H_full / 2.0)
         
-        # 归一化坐标到 [-1, 1]
-        x_norm = 2 * x / W - 1
-        y_norm = 2 * y / H - 1
+        # 广播到空间维度
+        flow_x = tx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, H, W)  # [B, K, 1, H, W]
+        flow_y = ty.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, H, W)
         
-        # 解析参数 [B, K, 12] -> 各项系数
-        p = params.view(B, K, 12, 1, 1)
+        flows = torch.cat([flow_x.squeeze(2), flow_y.squeeze(2)], dim=2)  # [B, K, 2, H, W]
         
-        # flow_x = p0 + p1*x + p2*y + p3*x^2 + p4*y^2 + p5*xy
-        # flow_y = p6 + p7*x + p8*y + p9*x^2 + p10*y^2 + p11*xy
-        flow_x = (p[:,:,0] + p[:,:,1]*x_norm + p[:,:,2]*y_norm + 
-                  p[:,:,3]*x_norm**2 + p[:,:,4]*y_norm**2 + p[:,:,5]*x_norm*y_norm)
-        flow_y = (p[:,:,6] + p[:,:,7]*x_norm + p[:,:,8]*y_norm + 
-                  p[:,:,9]*x_norm**2 + p[:,:,10]*y_norm**2 + p[:,:,11]*x_norm*y_norm)
-        
-        # 缩放回像素空间
-        flow_x = flow_x * W / 2
-        flow_y = flow_y * H / 2
-        
-        flows = torch.cat([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
-        
-        return flows, params
+        return flows, translation
 
 
 class MotionDecoder(nn.Module):
@@ -153,7 +140,7 @@ class MotionDecoder(nn.Module):
         self,
         slot_dim: int = 64,
         hidden_dim: int = 128,
-        motion_model: str = 'affine'  # 'affine' or 'quadratic'
+        motion_model: str = 'affine'  # 'affine' or 'translation'
     ):
         super().__init__()
         
@@ -161,8 +148,8 @@ class MotionDecoder(nn.Module):
         
         if motion_model == 'affine':
             self.motion_model = AffineMotionModel(slot_dim, hidden_dim)
-        elif motion_model == 'quadratic':
-            self.motion_model = QuadraticMotionModel(slot_dim, hidden_dim)
+        elif motion_model == 'translation':
+            self.motion_model = TranslationMotionModel(slot_dim, hidden_dim)
         else:
             raise ValueError(f"Unknown motion model: {motion_model}")
             
@@ -175,12 +162,13 @@ class MotionDecoder(nn.Module):
         coords = coords.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, 2, H, W]
         return coords
     
-    def forward(self, slots, masks, target_size):
+    def forward(self, slots, masks, target_size, full_size=None):
         """
         Args:
             slots: [B, K, D] slot 特征
             masks: [B, K, H, W] 分割 masks (softmax 归一化)
             target_size: (H, W) 目标光流尺寸
+            full_size: (H_full, W_full) 原始图像尺寸，用于缩放光流
             
         Returns:
             flow_recon: [B, 2, H, W] 重建的光流
@@ -191,11 +179,15 @@ class MotionDecoder(nn.Module):
         H, W = target_size
         device = slots.device
         
+        # 如果没有指定 full_size，假设是 8x 下采样
+        if full_size is None:
+            full_size = (H * 8, W * 8)
+        
         # 创建坐标网格
         coords = self.create_coord_grid(B, H, W, device)
         
         # 预测每个 slot 的运动场
-        slot_flows, motion_params = self.motion_model(slots, coords)  # [B, K, 2, H, W]
+        slot_flows, motion_params = self.motion_model(slots, coords, full_size)  # [B, K, 2, H, W]
         
         # 调整 masks 到目标尺寸
         if masks.shape[-2:] != (H, W):
@@ -214,13 +206,12 @@ class MotionDecoder(nn.Module):
         用于识别背景 (运动最小的 slot)
         """
         if self.motion_model_type == 'affine':
-            # 仿射模型: 运动幅度 ≈ |tx| + |ty| + |a-1| + |d-1| + |b| + |c|
-            a, b, tx, c, d, ty = motion_params.split(1, dim=-1)
-            magnitude = (tx.abs() + ty.abs() + 
-                        (a - 1).abs() + (d - 1).abs() + 
-                        b.abs() + c.abs()).squeeze(-1)
+            # 仿射模型: 使用所有参数的 L2 范数
+            magnitude = motion_params.abs().sum(dim=-1)
+        elif self.motion_model_type == 'translation':
+            # 平移模型: 使用平移向量的 L2 范数
+            magnitude = motion_params.norm(dim=-1)
         else:
-            # 二次模型: 使用所有参数的 L2 范数
             magnitude = motion_params.norm(dim=-1)
             
         return magnitude  # [B, K]
