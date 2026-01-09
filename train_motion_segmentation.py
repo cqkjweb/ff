@@ -143,6 +143,18 @@ def train_phase1(model, train_loader, cfg, logger_path):
                     loguru_logger.info(f"  flow_recon range: [{output['flow_recon'].min():.2f}, {output['flow_recon'].max():.2f}]")
                     loguru_logger.info(f"  masks sum: {output['masks'].sum(dim=1).mean():.4f}")
                 
+                # 每 1000 步打印一次详细信息
+                if total_steps > 0 and total_steps % 1000 == 0:
+                    with torch.no_grad():
+                        flow_err = (output['flow_recon'] - flow_target).abs().mean()
+                        flow_recon_mag = output['flow_recon'].abs().mean()
+                        flow_target_mag = flow_target.abs().mean()
+                    loguru_logger.info(
+                        f"  [详细] flow_recon_mag: {flow_recon_mag:.2f}, "
+                        f"flow_target_mag: {flow_target_mag:.2f}, "
+                        f"avg_err: {flow_err:.2f}"
+                    )
+                
                 # 计算损失
                 loss, loss_dict = criterion(output, flow_target)
             
@@ -301,7 +313,9 @@ def main():
     parser.add_argument('--slot_dim', type=int, default=64, help="slot dimension")
     parser.add_argument('--hidden_dim', type=int, default=128, help="hidden dimension")
     parser.add_argument('--slot_iterations', type=int, default=3, help="slot attention iterations")
-    parser.add_argument('--motion_model', type=str, default='translation', choices=['affine', 'translation'])
+    parser.add_argument('--motion_model', type=str, default='hybrid', 
+                        choices=['dense', 'cnn', 'hybrid'],
+                        help="motion model type: dense (MLP), cnn (CNN decoder), hybrid (homography + residual)")
     parser.add_argument('--feature_scale', type=str, default='1/8', choices=['1/4', '1/8'])
     
     # Phase 1 参数

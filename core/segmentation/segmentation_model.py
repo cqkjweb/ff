@@ -1,6 +1,10 @@
 """
 Motion Segmentation Model - 完整的多任务模型
 结合 FlowFormer + Slot Attention + Motion Decoder
+
+重新设计版本:
+- 支持复杂的非对齐视角变化
+- 使用混合运动模型 (全局单应性 + 局部残差)
 """
 
 import torch
@@ -20,8 +24,8 @@ class MotionSegmentationModel(nn.Module):
     Pipeline:
     1. FlowFormer Encoder 提取特征
     2. Slot Attention 聚类特征到 K 个 slots
-    3. Motion Decoder 从 slots 解码运动参数
-    4. 使用 masks 和运动参数重建光流
+    3. Motion Decoder 从 slots 解码运动
+    4. 使用 masks 和运动重建光流
     """
     
     def __init__(
@@ -31,7 +35,7 @@ class MotionSegmentationModel(nn.Module):
         slot_dim: int = 64,
         hidden_dim: int = 128,
         num_iterations: int = 3,
-        motion_model: str = 'affine',
+        motion_model: str = 'hybrid',  # 'dense', 'cnn', 'hybrid'
         feature_scale: str = '1/8'
     ):
         """
@@ -41,12 +45,13 @@ class MotionSegmentationModel(nn.Module):
             slot_dim: slot 特征维度
             hidden_dim: MLP 隐藏层维度
             num_iterations: Slot Attention 迭代次数
-            motion_model: 运动模型类型 ('affine' or 'quadratic')
+            motion_model: 运动模型类型
             feature_scale: 特征图分辨率
         """
         super().__init__()
         
         self.num_slots = num_slots
+        self.motion_model_type = motion_model
         
         # FlowFormer Wrapper
         self.flowformer_wrapper = FlowFormerWrapper(
@@ -55,7 +60,7 @@ class MotionSegmentationModel(nn.Module):
         )
         
         # Slot Attention Head
-        input_dim = self.flowformer_wrapper.context_dim
+        input_dim = self.flowformer_wrapper.context_dim  # 256
         self.slot_attention_head = SlotAttentionHead(
             input_dim=input_dim,
             num_slots=num_slots,
@@ -68,6 +73,7 @@ class MotionSegmentationModel(nn.Module):
         self.motion_decoder = MotionDecoder(
             slot_dim=slot_dim,
             hidden_dim=hidden_dim,
+            context_dim=input_dim,
             motion_model=motion_model
         )
 
@@ -82,18 +88,18 @@ class MotionSegmentationModel(nn.Module):
             
         Returns:
             dict containing:
-                - flow_pred: FlowFormer 预测的光流 (如果 return_flow=True)
+                - flow_pred: FlowFormer 预测的光流
                 - flow_recon: 重建的光流
                 - masks: [B, K, H, W] 分割 masks
                 - slots: [B, K, D] slot 特征
-                - slot_flows: [B, K, 2, H, W] 每个 slot 的运动场
-                - motion_params: [B, K, P] 运动参数
+                - slot_flows: [B, K, 2, H, W] 每个 slot 的光流
+                - motion_info: 运动参数信息
         """
         B, _, H, W = image1.shape
         
         # 1. 提取 FlowFormer 特征
         ff_output = self.flowformer_wrapper(image1, image2)
-        context_features = ff_output['context_features']
+        context_features = ff_output['context_features']  # [B, 256, H/8, W/8]
         feature_size = ff_output['feature_size']
         
         # 2. Slot Attention
@@ -102,17 +108,20 @@ class MotionSegmentationModel(nn.Module):
         )
         
         # 3. Motion Decoder - 重建光流
-        # 目标尺寸: 1/8 分辨率 (与 FlowFormer 内部一致)
         H8, W8 = H // 8, W // 8
-        flow_recon, slot_flows, motion_params = self.motion_decoder(
-            slots, attn_masks, target_size=(H8, W8), full_size=(H, W)
+        
+        flow_recon, slot_flows, motion_info = self.motion_decoder(
+            slots=slots,
+            masks=attn_masks,
+            target_size=(H8, W8),
+            full_size=(H, W),
+            context_feat=context_features
         )
         
         # 上采样重建光流到原始分辨率
         flow_recon_full = F.interpolate(
             flow_recon, size=(H, W), mode='bilinear', align_corners=False
         )
-        # 注意：不需要乘以 8，因为 motion_decoder 已经输出像素单位的光流
         
         # 上采样 masks 到原始分辨率
         masks_full = F.interpolate(
@@ -127,7 +136,7 @@ class MotionSegmentationModel(nn.Module):
             'masks_8x': attn_masks,
             'slots': slots,
             'slot_flows': slot_flows,
-            'motion_params': motion_params
+            'motion_info': motion_info
         }
         
         if return_flow:
@@ -151,54 +160,94 @@ class MotionSegmentationModel(nn.Module):
     def get_trainable_params(self, phase='phase1'):
         """
         获取不同训练阶段的可训练参数
-        
-        Args:
-            phase: 'phase1' (只训练 Seg Head) 或 'phase2' (联合训练)
         """
         if phase == 'phase1':
-            # 只返回 Slot Attention 和 Motion Decoder 的参数
             params = list(self.slot_attention_head.parameters())
             params += list(self.motion_decoder.parameters())
         elif phase == 'phase2':
-            # 返回所有可训练参数
             params = [p for p in self.parameters() if p.requires_grad]
         else:
             raise ValueError(f"Unknown phase: {phase}")
             
         return params
     
-    def identify_background(self, masks, motion_params):
+    def identify_foreground(self, masks, slot_flows, motion_info=None):
         """
-        识别背景 slot (面积最大且运动最小)
+        识别前景物体
+        
+        策略:
+        1. 如果有全局光流，计算每个 slot 相对于全局的残差
+        2. 残差大的是前景，残差小的是背景
         
         Args:
             masks: [B, K, H, W] 分割 masks
-            motion_params: [B, K, P] 运动参数
+            slot_flows: [B, K, 2, H, W] 每个 slot 的光流
+            motion_info: dict 包含全局光流等信息
             
         Returns:
-            bg_idx: [B] 每个样本的背景 slot 索引
             fg_mask: [B, 1, H, W] 前景 mask
+            bg_idx: [B] 背景 slot 索引
         """
         B, K, H, W = masks.shape
+        device = masks.device
         
-        # 计算每个 slot 的面积
-        areas = masks.sum(dim=(-2, -1))  # [B, K]
+        # 计算每个 slot 的运动幅度
+        slot_motion_mag = self.motion_decoder.compute_motion_magnitude(slot_flows)  # [B, K]
         
-        # 计算运动幅度
-        motion_mag = self.motion_decoder.compute_motion_magnitude(motion_params)  # [B, K]
-        
-        # 背景得分 = 面积大 + 运动小
-        # 归一化
-        areas_norm = areas / areas.sum(dim=1, keepdim=True)
-        motion_norm = motion_mag / (motion_mag.sum(dim=1, keepdim=True) + 1e-8)
-        
-        bg_score = areas_norm - motion_norm  # 面积大、运动小的得分高
-        bg_idx = bg_score.argmax(dim=1)  # [B]
+        if motion_info and 'global_flow' in motion_info:
+            # 计算相对于全局运动的残差
+            global_flow = motion_info['global_flow']  # [B, 2, H_s, W_s]
+            
+            # 上采样到 mask 尺寸
+            if global_flow.shape[-2:] != (H, W):
+                global_flow = F.interpolate(global_flow, size=(H, W), mode='bilinear', align_corners=False)
+            
+            # 计算每个 slot 与全局光流的差异
+            residual_mag = []
+            for k in range(K):
+                slot_flow_k = slot_flows[:, k]  # [B, 2, H_s, W_s]
+                if slot_flow_k.shape[-2:] != (H, W):
+                    slot_flow_k = F.interpolate(slot_flow_k, size=(H, W), mode='bilinear', align_corners=False)
+                
+                # 残差
+                residual = slot_flow_k - global_flow
+                residual_mag_k = torch.sqrt(residual[:, 0] ** 2 + residual[:, 1] ** 2 + 1e-8)
+                
+                # 用 mask 加权平均
+                weighted_residual = (residual_mag_k * masks[:, k]).sum(dim=(-2, -1)) / (masks[:, k].sum(dim=(-2, -1)) + 1e-8)
+                residual_mag.append(weighted_residual)
+            
+            residual_mag = torch.stack(residual_mag, dim=1)  # [B, K]
+            
+            # 背景 = 残差最小的 slot
+            bg_idx = residual_mag.argmin(dim=1)  # [B]
+            
+            # 前景 = 残差大于阈值的 slots
+            threshold = residual_mag.median(dim=1, keepdim=True)[0]
+            fg_slots = residual_mag > threshold
+            
+        else:
+            # 没有全局光流，用面积和运动幅度判断
+            areas = masks.sum(dim=(-2, -1))  # [B, K]
+            areas_norm = areas / areas.sum(dim=1, keepdim=True)
+            motion_norm = slot_motion_mag / (slot_motion_mag.sum(dim=1, keepdim=True) + 1e-8)
+            
+            # 背景 = 面积大 + 运动小
+            bg_score = areas_norm - motion_norm
+            bg_idx = bg_score.argmax(dim=1)
+            
+            # 前景 = 非背景
+            fg_slots = torch.ones(B, K, device=device, dtype=torch.bool)
+            for b in range(B):
+                fg_slots[b, bg_idx[b]] = False
         
         # 生成前景 mask
-        bg_mask = torch.zeros_like(masks[:, 0:1])  # [B, 1, H, W]
+        fg_mask = torch.zeros(B, 1, H, W, device=device)
         for b in range(B):
-            bg_mask[b, 0] = masks[b, bg_idx[b]]
-        fg_mask = 1 - bg_mask
+            for k in range(K):
+                if fg_slots[b, k]:
+                    fg_mask[b, 0] += masks[b, k]
         
-        return bg_idx, fg_mask
+        fg_mask = torch.clamp(fg_mask, 0, 1)
+        
+        return fg_mask, bg_idx

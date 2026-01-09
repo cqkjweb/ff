@@ -1,225 +1,474 @@
 """
-Motion Decoder - 从 Slot 特征解码运动参数，用于重建光流
-核心思想: 每个 slot 代表一个具有一致运动模式的区域
+Motion Decoder - 重新设计的复杂运动模型
+支持非对齐视角下的变化检测
+
+核心改进:
+1. 密集光流预测: 每个 Slot 预测完整的密集光流场，而非简单参数
+2. 多尺度解码: 使用 CNN Decoder 逐步上采样，捕获不同尺度的运动
+3. 残差学习: 预测相对于全局运动的残差，更容易学习
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+import math
 
 
-class AffineMotionModel(nn.Module):
+class ConvBlock(nn.Module):
+    """基础卷积块"""
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU()
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UpBlock(nn.Module):
+    """上采样块"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU()
+        )
+    
+    def forward(self, x):
+        return self.up(x)
+
+
+class DenseFlowDecoder(nn.Module):
     """
-    仿射运动模型 - 简化版本
-    每个 slot 直接预测光流的仿射参数
-    flow(x, y) = [a0 + a1*x_norm + a2*y_norm, b0 + b1*x_norm + b2*y_norm]
-    其中 x_norm, y_norm 是归一化到 [-1, 1] 的坐标
+    密集光流解码器
+    从 Slot 特征解码出完整的密集光流场
     """
     
     def __init__(self, slot_dim: int = 64, hidden_dim: int = 128):
         super().__init__()
         
-        self.motion_mlp = nn.Sequential(
+        self.slot_dim = slot_dim
+        
+        # Slot 特征投影
+        self.slot_proj = nn.Sequential(
             nn.Linear(slot_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 6)  # [a0, a1, a2, b0, b1, b2]
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # 使用 Xavier 初始化
-        for m in self.motion_mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        # 位置编码生成器
+        self.pos_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, hidden_dim)
+        )
         
-    def forward(self, slots, coords, image_size):
+        # 密集光流解码器 (类似 NeRF 的 MLP)
+        self.flow_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 2)  # 输出 (flow_x, flow_y)
+        )
+        
+        # 初始化最后一层为小值
+        nn.init.zeros_(self.flow_mlp[-1].bias)
+        nn.init.normal_(self.flow_mlp[-1].weight, std=0.01)
+
+    def forward(self, slots, H, W, full_size):
         """
         Args:
             slots: [B, K, D] slot 特征
-            coords: [B, 2, H, W] 像素坐标网格 (x, y)
-            image_size: (H_full, W_full) 原始图像尺寸，用于缩放
+            H, W: 特征图尺寸
+            full_size: (H_full, W_full) 原始图像尺寸
             
         Returns:
-            flows: [B, K, 2, H, W] 每个 slot 的运动场 (像素单位)
-            affine_params: [B, K, 6] 仿射参数
+            flows: [B, K, 2, H, W] 每个 slot 的密集光流场
         """
         B, K, D = slots.shape
-        _, _, H, W = coords.shape
-        H_full, W_full = image_size
+        H_full, W_full = full_size
+        device = slots.device
         
-        # 预测仿射参数
-        affine_params = self.motion_mlp(slots)  # [B, K, 6]
+        # 投影 slot 特征
+        slot_feat = self.slot_proj(slots)  # [B, K, hidden_dim]
         
-        # 归一化坐标到 [-1, 1]
-        x = coords[:, 0:1]  # [B, 1, H, W]
-        y = coords[:, 1:2]
-        x_norm = 2.0 * x / max(W - 1, 1) - 1.0  # [-1, 1]
-        y_norm = 2.0 * y / max(H - 1, 1) - 1.0
+        # 创建归一化坐标网格
+        y = torch.linspace(-1, 1, H, device=device)
+        x = torch.linspace(-1, 1, W, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        coords = torch.stack([xx, yy], dim=-1)  # [H, W, 2]
+        coords = coords.view(1, 1, H * W, 2).expand(B, K, -1, -1)  # [B, K, H*W, 2]
         
-        # 解析参数 [B, K, 6] - 乘以缩放因子让输出在合理范围
-        params_scaled = affine_params * 30.0  # 缩放到合理范围
+        # 位置编码
+        pos_enc = self.pos_encoder(coords)  # [B, K, H*W, hidden_dim]
         
-        a0 = params_scaled[:, :, 0].view(B, K, 1, 1)  # [B, K, 1, 1]
-        a1 = params_scaled[:, :, 1].view(B, K, 1, 1)
-        a2 = params_scaled[:, :, 2].view(B, K, 1, 1)
-        b0 = params_scaled[:, :, 3].view(B, K, 1, 1)
-        b1 = params_scaled[:, :, 4].view(B, K, 1, 1)
-        b2 = params_scaled[:, :, 5].view(B, K, 1, 1)
+        # 扩展 slot 特征到每个位置
+        slot_feat_expanded = slot_feat.unsqueeze(2).expand(-1, -1, H * W, -1)  # [B, K, H*W, hidden_dim]
         
-        # x_norm, y_norm: [B, 1, H, W] -> 广播到 [B, K, H, W]
-        x_norm = x_norm.squeeze(1)  # [B, H, W]
-        y_norm = y_norm.squeeze(1)  # [B, H, W]
+        # 拼接 slot 特征和位置编码
+        combined = torch.cat([slot_feat_expanded, pos_enc], dim=-1)  # [B, K, H*W, hidden_dim*2]
         
-        # 计算光流 - 直接在像素空间计算
-        # x_norm, y_norm 在 [-1, 1]，乘以参数后得到像素位移
-        flow_x = a0 + a1 * x_norm.unsqueeze(1) + a2 * y_norm.unsqueeze(1)  # [B, K, H, W]
-        flow_y = b0 + b1 * x_norm.unsqueeze(1) + b2 * y_norm.unsqueeze(1)  # [B, K, H, W]
+        # 预测光流
+        flow_pred = self.flow_mlp(combined)  # [B, K, H*W, 2]
         
-        # 堆叠成 [B, K, 2, H, W]
-        flows = torch.stack([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
+        # 缩放到像素空间
+        flow_pred = flow_pred * torch.tensor([W_full / 2, H_full / 2], device=device)
         
-        return flows, affine_params
+        # 重塑为空间形式
+        flows = flow_pred.view(B, K, H, W, 2).permute(0, 1, 4, 2, 3)  # [B, K, 2, H, W]
+        
+        return flows
 
 
-class TranslationMotionModel(nn.Module):
+class CNNFlowDecoder(nn.Module):
     """
-    纯平移运动模型 - 最简单的模型
-    每个 slot 只预测一个平移向量 (tx, ty)
+    CNN 密集光流解码器
+    使用卷积网络从 Slot 特征解码光流，更高效
     """
     
-    def __init__(self, slot_dim: int = 64, hidden_dim: int = 128):
+    def __init__(self, slot_dim: int = 64, hidden_dim: int = 128, output_scale: int = 8):
         super().__init__()
         
-        self.motion_mlp = nn.Sequential(
-            nn.Linear(slot_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2)  # [tx, ty] 直接输出像素单位的位移
+        self.slot_dim = slot_dim
+        self.output_scale = output_scale
+        
+        # Slot 到空间特征的投影
+        self.slot_to_spatial = nn.Sequential(
+            nn.Linear(slot_dim, hidden_dim * 4 * 4),
+            nn.GELU()
         )
         
-        # 使用 Xavier 初始化，让输出有合理的初始范围
-        for m in self.motion_mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        # CNN 解码器
+        self.decoder = nn.Sequential(
+            # 4x4 -> 8x8
+            UpBlock(hidden_dim, hidden_dim),
+            ConvBlock(hidden_dim, hidden_dim),
+            # 8x8 -> 16x16
+            UpBlock(hidden_dim, hidden_dim // 2),
+            ConvBlock(hidden_dim // 2, hidden_dim // 2),
+            # 16x16 -> 32x32
+            UpBlock(hidden_dim // 2, hidden_dim // 4),
+            ConvBlock(hidden_dim // 4, hidden_dim // 4),
+        )
         
-    def forward(self, slots, coords, image_size):
+        # 光流预测头
+        self.flow_head = nn.Sequential(
+            nn.Conv2d(hidden_dim // 4, hidden_dim // 4, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 4, 2, 3, 1, 1)
+        )
+        
+        # 初始化
+        nn.init.zeros_(self.flow_head[-1].bias)
+        nn.init.normal_(self.flow_head[-1].weight, std=0.01)
+    
+    def forward(self, slots, H, W, full_size):
         """
         Args:
             slots: [B, K, D] slot 特征
-            coords: [B, 2, H, W] 像素坐标网格
-            image_size: (H_full, W_full) 原始图像尺寸
+            H, W: 目标特征图尺寸
+            full_size: (H_full, W_full) 原始图像尺寸
             
         Returns:
-            flows: [B, K, 2, H, W] 每个 slot 的运动场
-            motion_params: [B, K, 2] 平移参数
+            flows: [B, K, 2, H, W] 每个 slot 的密集光流场
         """
         B, K, D = slots.shape
+        H_full, W_full = full_size
+        device = slots.device
+        
+        flows_list = []
+        
+        for k in range(K):
+            slot_k = slots[:, k]  # [B, D]
+            
+            # 投影到空间特征
+            spatial = self.slot_to_spatial(slot_k)  # [B, hidden_dim * 16]
+            spatial = spatial.view(B, -1, 4, 4)  # [B, hidden_dim, 4, 4]
+            
+            # CNN 解码
+            feat = self.decoder(spatial)  # [B, hidden_dim//4, 32, 32]
+            
+            # 上采样到目标尺寸
+            feat = F.interpolate(feat, size=(H, W), mode='bilinear', align_corners=False)
+            
+            # 预测光流
+            flow_k = self.flow_head(feat)  # [B, 2, H, W]
+            
+            # 缩放到像素空间 (乘以一个可学习的缩放因子)
+            flow_k = flow_k * 50.0  # 基础缩放
+            
+            flows_list.append(flow_k)
+        
+        flows = torch.stack(flows_list, dim=1)  # [B, K, 2, H, W]
+        
+        return flows
+
+
+class HybridMotionDecoder(nn.Module):
+    """
+    混合运动解码器 - 最强大的版本
+    
+    结合:
+    1. 全局单应性估计 (处理视角变化)
+    2. 局部残差光流 (处理独立运动物体)
+    
+    这样可以:
+    - 全局单应性补偿相机运动/视角变化
+    - 残差光流捕获前景物体的独立运动
+    """
+    
+    def __init__(self, slot_dim: int = 64, hidden_dim: int = 128, context_dim: int = 256):
+        super().__init__()
+        
+        self.slot_dim = slot_dim
+        self.context_dim = context_dim
+        
+        # 全局运动估计器 (从 context 特征估计)
+        self.global_motion_encoder = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 8)  # 8 参数的单应性 (去掉 scale)
+        )
+        
+        # 初始化为恒等变换
+        nn.init.zeros_(self.global_motion_encoder[-1].weight)
+        nn.init.zeros_(self.global_motion_encoder[-1].bias)
+        
+        # 每个 Slot 的残差光流解码器
+        self.slot_proj = nn.Sequential(
+            nn.Linear(slot_dim, hidden_dim),
+            nn.GELU()
+        )
+        
+        # 残差光流 CNN
+        self.residual_decoder = nn.Sequential(
+            nn.Conv2d(hidden_dim + 2, hidden_dim, 3, 1, 1),  # +2 for position
+            nn.GroupNorm(8, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim // 2, 3, 1, 1),
+            nn.GroupNorm(8, hidden_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 2, 2, 3, 1, 1)
+        )
+        
+        # 初始化残差为小值
+        nn.init.zeros_(self.residual_decoder[-1].bias)
+        nn.init.normal_(self.residual_decoder[-1].weight, std=0.001)
+    
+    def compute_homography_flow(self, H_params, coords, H_full, W_full):
+        """
+        从单应性参数计算光流
+        
+        H_params: [B, 8] 单应性参数 (h11-1, h12, h13, h21, h22-1, h23, h31, h32)
+        coords: [B, 2, H, W] 归一化坐标
+        """
+        B = H_params.shape[0]
         _, _, H, W = coords.shape
-        H_full, W_full = image_size
+        device = H_params.device
         
-        # 预测平移参数 - 直接输出像素单位的位移
-        # 乘以一个缩放因子让初始输出在合理范围
-        translation = self.motion_mlp(slots) * 50.0  # [B, K, 2], 缩放到 ~[-50, 50] 像素
+        # 构建单应性矩阵
+        # H = [[1+h11, h12, h13], [h21, 1+h22, h23], [h31, h32, 1]]
+        h11 = H_params[:, 0].view(B, 1, 1)
+        h12 = H_params[:, 1].view(B, 1, 1)
+        h13 = H_params[:, 2].view(B, 1, 1)
+        h21 = H_params[:, 3].view(B, 1, 1)
+        h22 = H_params[:, 4].view(B, 1, 1)
+        h23 = H_params[:, 5].view(B, 1, 1)
+        h31 = H_params[:, 6].view(B, 1, 1)
+        h32 = H_params[:, 7].view(B, 1, 1)
         
-        tx = translation[:, :, 0]  # [B, K]
-        ty = translation[:, :, 1]  # [B, K]
+        # 归一化坐标
+        x = coords[:, 0]  # [B, H, W]
+        y = coords[:, 1]
         
-        # 广播到空间维度 [B, K] -> [B, K, H, W]
-        flow_x = tx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)  # [B, K, H, W]
-        flow_y = ty.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)  # [B, K, H, W]
+        # 单应性变换: x' = (h11*x + h12*y + h13) / (h31*x + h32*y + 1)
+        denom = h31 * x + h32 * y + 1.0
+        denom = torch.clamp(denom, min=1e-6)  # 防止除零
         
-        # 堆叠成 [B, K, 2, H, W]
-        flows = torch.stack([flow_x, flow_y], dim=2)  # [B, K, 2, H, W]
+        x_new = ((1 + h11) * x + h12 * y + h13) / denom
+        y_new = (h21 * x + (1 + h22) * y + h23) / denom
         
-        return flows, translation
+        # 光流 = 新坐标 - 原坐标 (归一化空间)
+        flow_x_norm = x_new - x
+        flow_y_norm = y_new - y
+        
+        # 转换到像素空间
+        flow_x = flow_x_norm * (W_full / 2)
+        flow_y = flow_y_norm * (H_full / 2)
+        
+        return torch.stack([flow_x, flow_y], dim=1)  # [B, 2, H, W]
+    
+    def forward(self, slots, masks, context_feat, target_size, full_size):
+        """
+        Args:
+            slots: [B, K, D] slot 特征
+            masks: [B, K, H, W] 分割 masks
+            context_feat: [B, C, H_ctx, W_ctx] 上下文特征
+            target_size: (H, W) 目标光流尺寸
+            full_size: (H_full, W_full) 原始图像尺寸
+            
+        Returns:
+            flow_recon: [B, 2, H, W] 重建的光流
+            slot_flows: [B, K, 2, H, W] 每个 slot 的光流
+            global_flow: [B, 2, H, W] 全局光流
+            motion_info: dict 包含运动参数
+        """
+        B, K, D = slots.shape
+        H, W = target_size
+        H_full, W_full = full_size
+        device = slots.device
+        
+        # 1. 估计全局单应性
+        H_params = self.global_motion_encoder(context_feat)  # [B, 8]
+        
+        # 创建归一化坐标网格
+        y = torch.linspace(-1, 1, H, device=device)
+        x = torch.linspace(-1, 1, W, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        coords = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
+        
+        # 计算全局光流
+        global_flow = self.compute_homography_flow(H_params, coords, H_full, W_full)  # [B, 2, H, W]
+        
+        # 2. 计算每个 Slot 的残差光流
+        slot_feat = self.slot_proj(slots)  # [B, K, hidden_dim]
+        
+        slot_flows_list = []
+        for k in range(K):
+            # 广播 slot 特征到空间
+            feat_k = slot_feat[:, k].unsqueeze(-1).unsqueeze(-1)  # [B, hidden_dim, 1, 1]
+            feat_k = feat_k.expand(-1, -1, H, W)  # [B, hidden_dim, H, W]
+            
+            # 拼接位置信息
+            feat_with_pos = torch.cat([feat_k, coords], dim=1)  # [B, hidden_dim+2, H, W]
+            
+            # 预测残差光流
+            residual_flow = self.residual_decoder(feat_with_pos)  # [B, 2, H, W]
+            residual_flow = residual_flow * 30.0  # 缩放
+            
+            # 总光流 = 全局光流 + 残差光流
+            total_flow_k = global_flow + residual_flow
+            slot_flows_list.append(total_flow_k)
+        
+        slot_flows = torch.stack(slot_flows_list, dim=1)  # [B, K, 2, H, W]
+        
+        # 3. 调整 masks 尺寸
+        if masks.shape[-2:] != (H, W):
+            masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
+            masks = F.softmax(masks, dim=1)
+        
+        # 4. 加权组合
+        masks_expanded = masks.unsqueeze(2)  # [B, K, 1, H, W]
+        flow_recon = (masks_expanded * slot_flows).sum(dim=1)  # [B, 2, H, W]
+        
+        motion_info = {
+            'homography_params': H_params,
+            'global_flow': global_flow
+        }
+        
+        return flow_recon, slot_flows, global_flow, motion_info
 
 
 class MotionDecoder(nn.Module):
     """
-    完整的 Motion Decoder
-    结合 Slot 特征和 Masks 重建光流场
+    统一的 Motion Decoder 接口
+    支持多种运动模型
     """
     
     def __init__(
         self,
         slot_dim: int = 64,
         hidden_dim: int = 128,
-        motion_model: str = 'affine'  # 'affine' or 'translation'
+        context_dim: int = 256,
+        motion_model: str = 'hybrid'  # 'dense', 'cnn', 'hybrid'
     ):
         super().__init__()
         
         self.motion_model_type = motion_model
+        self.context_dim = context_dim
         
-        if motion_model == 'affine':
-            self.motion_model = AffineMotionModel(slot_dim, hidden_dim)
-        elif motion_model == 'translation':
-            self.motion_model = TranslationMotionModel(slot_dim, hidden_dim)
+        if motion_model == 'dense':
+            self.motion_model = DenseFlowDecoder(slot_dim, hidden_dim)
+        elif motion_model == 'cnn':
+            self.motion_model = CNNFlowDecoder(slot_dim, hidden_dim)
+        elif motion_model == 'hybrid':
+            self.motion_model = HybridMotionDecoder(slot_dim, hidden_dim, context_dim)
         else:
             raise ValueError(f"Unknown motion model: {motion_model}")
-            
-    def create_coord_grid(self, B, H, W, device):
-        """创建像素坐标网格"""
-        y = torch.arange(H, device=device).float()
-        x = torch.arange(W, device=device).float()
-        yy, xx = torch.meshgrid(y, x, indexing='ij')
-        coords = torch.stack([xx, yy], dim=0)  # [2, H, W]
-        coords = coords.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, 2, H, W]
-        return coords
     
-    def forward(self, slots, masks, target_size, full_size=None):
+    def forward(self, slots, masks, target_size, full_size=None, context_feat=None):
         """
         Args:
             slots: [B, K, D] slot 特征
-            masks: [B, K, H, W] 分割 masks (softmax 归一化)
+            masks: [B, K, H_m, W_m] 分割 masks
             target_size: (H, W) 目标光流尺寸
-            full_size: (H_full, W_full) 原始图像尺寸，用于缩放光流
+            full_size: (H_full, W_full) 原始图像尺寸
+            context_feat: [B, C, H_ctx, W_ctx] 上下文特征 (hybrid 模式需要)
             
         Returns:
             flow_recon: [B, 2, H, W] 重建的光流
-            slot_flows: [B, K, 2, H, W] 每个 slot 的运动场
-            motion_params: [B, K, P] 运动参数
+            slot_flows: [B, K, 2, H, W] 每个 slot 的光流
+            motion_info: dict 运动信息
         """
         B, K, D = slots.shape
         H, W = target_size
-        device = slots.device
         
-        # 如果没有指定 full_size，假设是 8x 下采样
         if full_size is None:
             full_size = (H * 8, W * 8)
         
-        # 创建坐标网格
-        coords = self.create_coord_grid(B, H, W, device)
+        if self.motion_model_type == 'hybrid':
+            if context_feat is None:
+                raise ValueError("Hybrid model requires context_feat")
+            flow_recon, slot_flows, global_flow, motion_info = self.motion_model(
+                slots, masks, context_feat, target_size, full_size
+            )
+        else:
+            # dense 或 cnn 模式
+            slot_flows = self.motion_model(slots, H, W, full_size)  # [B, K, 2, H, W]
+            
+            # 调整 masks 尺寸
+            if masks.shape[-2:] != (H, W):
+                masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
+                masks = F.softmax(masks, dim=1)
+            
+            # 加权组合
+            masks_expanded = masks.unsqueeze(2)  # [B, K, 1, H, W]
+            flow_recon = (masks_expanded * slot_flows).sum(dim=1)  # [B, 2, H, W]
+            
+            motion_info = {}
         
-        # 预测每个 slot 的运动场
-        slot_flows, motion_params = self.motion_model(slots, coords, full_size)  # [B, K, 2, H, W]
-        
-        # 调整 masks 到目标尺寸
-        if masks.shape[-2:] != (H, W):
-            masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
-            masks = F.softmax(masks, dim=1)  # 重新归一化
-        
-        # 加权组合: flow = sum_k(mask_k * flow_k)
-        masks_expanded = masks.unsqueeze(2)  # [B, K, 1, H, W]
-        flow_recon = (masks_expanded * slot_flows).sum(dim=1)  # [B, 2, H, W]
-        
-        return flow_recon, slot_flows, motion_params
+        return flow_recon, slot_flows, motion_info
     
-    def compute_motion_magnitude(self, motion_params):
+    def compute_motion_magnitude(self, slot_flows):
         """
         计算每个 slot 的运动幅度
-        用于识别背景 (运动最小的 slot)
-        """
-        if self.motion_model_type == 'affine':
-            # 仿射模型: 使用所有参数的 L2 范数
-            magnitude = motion_params.abs().sum(dim=-1)
-        elif self.motion_model_type == 'translation':
-            # 平移模型: 使用平移向量的 L2 范数
-            magnitude = motion_params.norm(dim=-1)
-        else:
-            magnitude = motion_params.norm(dim=-1)
+        
+        Args:
+            slot_flows: [B, K, 2, H, W]
             
-        return magnitude  # [B, K]
+        Returns:
+            magnitude: [B, K] 每个 slot 的平均运动幅度
+        """
+        # 计算每个位置的光流幅度
+        flow_mag = torch.sqrt(slot_flows[:, :, 0] ** 2 + slot_flows[:, :, 1] ** 2 + 1e-8)  # [B, K, H, W]
+        
+        # 平均
+        magnitude = flow_mag.mean(dim=(-2, -1))  # [B, K]
+        
+        return magnitude
