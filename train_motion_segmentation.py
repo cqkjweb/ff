@@ -207,6 +207,7 @@ def train_phase2(model, train_loader, cfg, logger_path):
     - 解冻 Encoder 的后几层
     - 联合优化光流和分割
     - Loss = Weight_Flow * L_Flow + Weight_Seg * L_Recon
+    - 使用更小的 batch size 和梯度累积来节省显存
     """
     loguru_logger.info("=" * 50)
     loguru_logger.info("Phase 2: Joint Training (Partial Unfreezing)")
@@ -252,52 +253,87 @@ def train_phase2(model, train_loader, cfg, logger_path):
     
     scaler = GradScaler(enabled=cfg.mixed_precision)
     
+    # 多 GPU 支持
+    if torch.cuda.device_count() > 1:
+        loguru_logger.info(f"Using {torch.cuda.device_count()} GPUs for Phase 2")
+        model = nn.DataParallel(model)
+    
     model.cuda()
     model.train()
     
+    # 梯度累积设置
+    grad_accum_steps = getattr(cfg, 'gradient_accumulation', 2)
+    loguru_logger.info(f"Gradient accumulation steps: {grad_accum_steps}")
+    
+    # 重新创建 DataLoader 使用更小的 batch size
+    import torch.utils.data as data
+    phase2_batch_size = getattr(cfg, 'phase2_batch_size', 2)
+    loguru_logger.info(f"Phase 2 batch size: {phase2_batch_size}")
+    
+    phase2_loader = data.DataLoader(
+        train_loader.dataset,
+        batch_size=phase2_batch_size,
+        pin_memory=False,
+        shuffle=True,
+        num_workers=8,
+        drop_last=True
+    )
+    
     total_steps = 0
     running_loss = 0.0
+    accum_count = 0
+    optimizer.zero_grad()
     
     while total_steps < cfg.phase2_steps:
-        for i_batch, data_blob in enumerate(train_loader):
+        for i_batch, data_blob in enumerate(phase2_loader):
             image1, image2, flow_gt, valid = [x.cuda() for x in data_blob]
-            
-            optimizer.zero_grad()
             
             with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
                 output = model(image1, image2, return_flow=True)
                 loss, loss_dict = criterion(output, flow_gt, valid)
+                loss = loss / grad_accum_steps  # 梯度累积时需要除以累积步数
             
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, cfg.clip)
-            scaler.step(optimizer)
-            scheduler.step()
-            scaler.update()
+            accum_count += 1
             
-            running_loss += loss.item()
-            total_steps += 1
+            if accum_count >= grad_accum_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.clip)
+                scaler.step(optimizer)
+                scheduler.step()
+                scaler.update()
+                optimizer.zero_grad()
+                accum_count = 0
+                total_steps += 1
+                
+                running_loss += loss.item() * grad_accum_steps
             
-            if total_steps % cfg.log_freq == 0:
-                avg_loss = running_loss / cfg.log_freq
-                loguru_logger.info(
-                    f"Phase2 Step {total_steps}/{cfg.phase2_steps} | "
-                    f"Loss: {avg_loss:.4f} | "
-                    f"Flow: {loss_dict.get('loss_flow', 0):.4f} | "
-                    f"Recon: {loss_dict['loss_recon']:.4f}"
-                )
-                running_loss = 0.0
-                
-            if total_steps % cfg.save_freq == 0:
-                save_path = os.path.join(logger_path, f'phase2_step{total_steps}.pth')
-                torch.save(model.state_dict(), save_path)
-                
-            if total_steps >= cfg.phase2_steps:
-                break
+                if total_steps % cfg.log_freq == 0:
+                    avg_loss = running_loss / cfg.log_freq
+                    loguru_logger.info(
+                        f"Phase2 Step {total_steps}/{cfg.phase2_steps} | "
+                        f"Loss: {avg_loss:.4f} | "
+                        f"Flow: {loss_dict.get('loss_flow', 0):.4f} | "
+                        f"Recon: {loss_dict['loss_recon']:.4f}"
+                    )
+                    running_loss = 0.0
+                    
+                if total_steps % cfg.save_freq == 0:
+                    # 保存时处理 DataParallel
+                    state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                    save_path = os.path.join(logger_path, f'phase2_step{total_steps}.pth')
+                    torch.save(state_dict, save_path)
+                    
+                if total_steps >= cfg.phase2_steps:
+                    break
+        
+        if total_steps >= cfg.phase2_steps:
+            break
     
     # 保存最终模型
+    state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
     save_path = os.path.join(logger_path, 'final_model.pth')
-    torch.save(model.state_dict(), save_path)
+    torch.save(state_dict, save_path)
     loguru_logger.info(f"Phase 2 completed. Saved to {save_path}")
     
     return model
@@ -326,6 +362,8 @@ def main():
     # Phase 2 参数
     parser.add_argument('--phase2_steps', type=int, default=100000, help="phase 2 training steps")
     parser.add_argument('--phase2_lr', type=float, default=1e-4, help="phase 2 learning rate")
+    parser.add_argument('--phase2_batch_size', type=int, default=2, help="phase 2 batch size (smaller to save memory)")
+    parser.add_argument('--gradient_accumulation', type=int, default=2, help="gradient accumulation steps")
     parser.add_argument('--unfreeze_layers', type=int, default=2, help="number of encoder layers to unfreeze")
     parser.add_argument('--flow_weight', type=float, default=1.0, help="flow loss weight")
     parser.add_argument('--seg_weight', type=float, default=0.5, help="segmentation loss weight")

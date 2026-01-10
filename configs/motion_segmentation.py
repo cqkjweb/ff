@@ -53,6 +53,8 @@ _C.phase1_lr = 2e-4
 # Phase 2 训练配置
 _C.phase2_steps = 100000
 _C.phase2_lr = 1e-4
+_C.phase2_batch_size = 2  # Phase 2 使用更小的 batch size
+_C.gradient_accumulation = 2  # 梯度累积步数
 _C.unfreeze_layers = 2
 _C.flow_weight = 1.0
 _C.seg_weight = 0.5

@@ -243,18 +243,15 @@ class HybridMotionDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 8),  # 8 参数的单应性 (去掉 scale)
-            nn.Tanh()  # 限制参数范围
+            nn.Linear(hidden_dim, 8)  # 8 参数的单应性 (去掉 scale)
         )
         
         # 使用正常初始化
-        nn.init.xavier_uniform_(self.global_motion_encoder[-2].weight)
-        nn.init.zeros_(self.global_motion_encoder[-2].bias)
+        nn.init.xavier_uniform_(self.global_motion_encoder[-1].weight)
+        nn.init.zeros_(self.global_motion_encoder[-1].bias)
         
-        # 单应性参数的缩放因子 (tanh 输出 * scale 得到实际参数)
-        # 对于平移参数 (h13, h23)，需要较大的范围
-        # 对于其他参数，范围较小
-        self.homography_scale = 0.5  # 控制单应性变换的强度
+        # 可学习的单应性参数缩放因子
+        self.homography_scale = nn.Parameter(torch.tensor(0.1))
         
         # 每个 Slot 的残差光流解码器
         self.slot_proj = nn.Sequential(
@@ -275,16 +272,16 @@ class HybridMotionDecoder(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1),
             nn.GroupNorm(8, hidden_dim),
             nn.GELU(),
-            nn.Conv2d(hidden_dim, 2, 3, 1, 1),
-            nn.Tanh()  # 限制输出在 [-1, 1]
+            nn.Conv2d(hidden_dim, 2, 3, 1, 1)
+            # 不使用 tanh，让网络自由学习
         )
         
-        # 使用正常初始化，tanh 会限制输出范围
-        nn.init.xavier_uniform_(self.residual_decoder[-2].weight)
-        nn.init.zeros_(self.residual_decoder[-2].bias)
+        # 使用正常初始化
+        nn.init.xavier_uniform_(self.residual_decoder[-1].weight)
+        nn.init.zeros_(self.residual_decoder[-1].bias)
         
-        # 最大光流幅度 - 固定值，不需要学习
-        self.max_flow = 150.0  # 像素
+        # 可学习的缩放因子，初始化为合理值
+        self.residual_scale = nn.Parameter(torch.tensor(30.0))
     
     def compute_homography_flow(self, H_params, coords, H_full, W_full):
         """
@@ -375,10 +372,10 @@ class HybridMotionDecoder(nn.Module):
             # 拼接位置信息
             feat_with_pos = torch.cat([feat_k, coords], dim=1)  # [B, hidden_dim+2, H, W]
             
-            # 预测残差光流 (输出已经经过 tanh，范围 [-1, 1])
+            # 预测残差光流
             residual_flow = self.residual_decoder(feat_with_pos)  # [B, 2, H, W]
-            # 缩放到像素空间
-            residual_flow = residual_flow * self.max_flow
+            # 使用可学习的缩放因子
+            residual_flow = residual_flow * self.residual_scale
             
             # 总光流 = 全局光流 + 残差光流
             total_flow_k = global_flow + residual_flow
