@@ -436,12 +436,22 @@ def main():
     if not args.skip_phase1:
         if args.phase1_ckpt is not None:
             loguru_logger.info(f"Loading Phase 1 checkpoint from {args.phase1_ckpt}")
-            model.load_state_dict(torch.load(args.phase1_ckpt))
+            state_dict = torch.load(args.phase1_ckpt)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                loguru_logger.warning(f"Missing keys (will use default init): {missing}")
+            if unexpected:
+                loguru_logger.warning(f"Unexpected keys (ignored): {unexpected}")
         model = train_phase1(model, train_loader, cfg, str(log_dir))
     else:
         if args.phase1_ckpt is not None:
             loguru_logger.info(f"Loading Phase 1 checkpoint from {args.phase1_ckpt}")
-            model.load_state_dict(torch.load(args.phase1_ckpt))
+            state_dict = torch.load(args.phase1_ckpt)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                loguru_logger.warning(f"Missing keys (will use default init): {missing}")
+            if unexpected:
+                loguru_logger.warning(f"Unexpected keys (ignored): {unexpected}")
     
     # Phase 2
     model = train_phase2(model, train_loader, cfg, str(log_dir))
